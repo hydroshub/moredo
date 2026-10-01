@@ -11,6 +11,97 @@ import hashlib
 import pickle
 import config
 
+class TimeBlockCV:
+    def __init__(self, years, num_folds=5, spinup_years=None, spinup_until=None):
+        self.num_folds = num_folds
+
+        # Determine spinup years
+        all_years = sorted(np.unique(np.array(years).astype(int)))
+        if spinup_years is not None:
+            spinup_years = list(sorted(set(spinup_years)))
+        elif spinup_until is not None:
+            spinup_years = [y for y in all_years if y < spinup_until]
+        else:
+            spinup_years = []
+
+        self.spinup_years = list(map(int, spinup_years))
+
+        # Remaining years used for CV
+        self.unique_years = [y for y in all_years if y not in self.spinup_years]
+
+        # Prepare folds
+        self.fold_years = len(self.unique_years) // num_folds
+        self.folds = self._generate_folds()
+
+    # -----
+    # Internal fold generation
+    # -----
+    def _generate_folds(self):
+        return [
+            self.unique_years[i:i + self.fold_years]
+            for i in range(0, len(self.unique_years), self.fold_years)
+        ]
+
+    # -----
+    # Get train/val/test years per fold
+    # -----
+    def get_masks(self, fold_idx, time_index=None, val_stride=4, val_offset=3):
+        test_years = set(self.folds[fold_idx])
+        non_test_years = [y for y in self.unique_years if y not in test_years]
+        val_years = [y for i, y in enumerate(non_test_years) if (i % val_stride) == val_offset]
+        train_years = [y for y in non_test_years if y not in val_years]
+
+        result = {
+            "years_train": list(map(int, train_years)),
+            "years_val": list(map(int, val_years)),
+            "years_test": sorted(map(int, test_years)),
+        }
+
+        if time_index is not None:
+            result["spinup_mask"] = self.get_spinup_mask(time_index)
+
+        return result
+
+    # -----
+    # Convert year list to mask
+    # -----
+    def get_mask(self, time_index, year_list):
+        years = np.array([ts.year for ts in time_index])
+        return np.isin(years, year_list)
+
+    # -----
+    # Get spinup mask
+    # -----
+    def get_spinup_mask(self, time_index):
+        years = np.array([ts.year for ts in time_index])
+        return np.isin(years, self.spinup_years)
+
+    # -----
+    # Convenience: get all masks (spinup/train/val/test)
+    # -----
+    def get_full_mask_dict(self, fold_idx, time_index, val_stride=4, val_offset=3):
+        masks = self.get_masks(fold_idx, time_index, val_stride, val_offset)
+        return {
+            "spinup_mask": self.get_spinup_mask(time_index),
+            "train_mask": self.get_mask(time_index, masks["years_train"]),
+            "val_mask": self.get_mask(time_index, masks["years_val"]),
+            "test_mask": self.get_mask(time_index, masks["years_test"]),
+        }
+
+    # -----
+    # Print summary of current fold
+    # -----
+    def print_summary(self, fold_idx, valid_ids=None, time_index=None):
+        m = self.get_masks(fold_idx)
+        n_basins = len(valid_ids) if valid_ids is not None else "?"
+        print("─" * 50)
+        print(f"Cross-validation summary (Fold {fold_idx})  [temporal]")
+        print(f"  Basins      : {n_basins}")
+        print(f"  Spinup years: {self.spinup_years}")
+        print(f"  Train years : {m['years_train']}")
+        print(f"  Val years   : {m['years_val']}")
+        print(f"  Test years  : {m['years_test']}")
+
 class BaseSpatialCV:
     def __init__(self, basin_ids, num_folds=5, spinup_until=None, seed=42):
         self.basin_ids = np.array(sorted(list(set(basin_ids))))
@@ -139,7 +230,7 @@ class AttributeProcessor:
             col = df_proc[c].copy()
             if "ele" in c.lower():
                 col = np.sqrt(col.clip(lower=0, upper=5000))
-            elif "area" in c.lower():
+            elif "area" in c.lower() or "perimeter" in c.lower():
                 col = np.log1p(col.clip(lower=0))
             offset, scaler = config.ATTR_NORM[c]
             out[f"{c}_normed"] = (col.values - offset) / scaler

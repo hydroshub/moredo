@@ -9,6 +9,13 @@
 - transfer across scales for global inference (e.g., basin to grid) 🌍
 - diagnose 🔍 root-zone ecohydrology 💧🌱
 
+> **Branch `latent-subsidy`.** This branch extends MOREDO with a learned latent subsurface water
+> subsidy (F_add) and static, instantaneous and recurrent subsidy encoders, and holds the code of
+> Greiner et al., *Physics-constrained latent process learning for hidden subsurface water
+> subsidies to ecosystems* (in preparation). The experiments, the analysis pipeline and the
+> figure map are described in [README_latent_subsidy.md](README_latent_subsidy.md), and the
+> changes to the model code are listed in [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## 📁 Directory structure
@@ -17,7 +24,10 @@
 moredo/
 ├── configs/
 │   ├── config_base.py               # Configuration (all settings, with comments)
-│   └── spatial_cv_folds_example.py  # Example predefined fold dict for spatial CV
+│   ├── spatial_cv_folds_example.py  # Example predefined fold dict for spatial CV
+│   ├── config_global_spatial.py     # GRDC-Caravan setup of the latent-subsidy experiments
+│   ├── config_lateral_*.py          # latent-subsidy experiment configs
+│   └── basin_list_*.txt             # study catchments (all, and the large-catchment subset)
 ├── libs/
 │   ├── model.py                     # HybridModel definition
 │   ├── data.py                      # Data loading, caching, CV classes
@@ -25,9 +35,12 @@ moredo/
 ├── scripts/
 │   ├── train.py                     # Training + evaluation entry point
 │   ├── inference_basin.py           # Inference on basin time series
-│   └── inference_grid.py            # Inference on spatial grid (NetCDF output)
+│   ├── inference_grid.py            # Inference on spatial grid (NetCDF output)
+│   └── analysis/                    # latent-subsidy analysis and figure pipeline
+├── slurm/                           # SLURM job scripts of the latent-subsidy experiments
 ├── requirements.txt
-└── CHANGELOG.md
+├── CHANGELOG.md
+└── README_latent_subsidy.md         # experiments, analysis pipeline and figure map
 ```
 
 ---

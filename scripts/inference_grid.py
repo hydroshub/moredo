@@ -9,6 +9,7 @@ import torch
 # Read all driver data for full year
 # ----------------------------------------------------------
 def safe_open(path, var_name=None):
+    """Open a gridded driver file and return the named variable (or the whole dataset)."""
     if var_name is not None:
         da = xr.open_dataset(path)[var_name]
     else:
@@ -36,6 +37,7 @@ def safe_open(path, var_name=None):
     return da
 
 def read_drivers_for_year(year):
+    """Read the gridded meteorological and vegetation drivers for one calendar year."""
     import config
     driver_list = []
     for month in range(1, 13):
@@ -56,11 +58,12 @@ def read_drivers_for_year(year):
 # Spinup: cycle one year n times to warm up model states
 # ----------------------------------------------------------
 def run_spinup_cycles(spinup_year, n_cycles, model_path, attr_tensor, land_mask, out_dir, device, fold, seed):
+    """Repeat the spin-up year for n_cycles to initialize the physical (and LSTM) states on the grid."""
     import config
     from libs.model import HybridModel
     print(f"\n===== Spinup: year {spinup_year} × {n_cycles} cycles =====")
 
-    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS).to(device)
+    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS, lstm_hidden_size=config.LSTM_HIDDEN_SIZE).to(device)
     model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')))
     model.eval()
 
@@ -75,7 +78,7 @@ def run_spinup_cycles(spinup_year, n_cycles, model_path, attr_tensor, land_mask,
     dates = pd.date_range(f"{spinup_year}-01-01", f"{spinup_year}-12-31", freq='D')
     date_seq_tensor = torch.tensor([d.toordinal() for d in dates], dtype=torch.long, device=device)
 
-    states, diagnos = None, None
+    states, diagnos, hidden = None, None, None
     init_state_keys   = set(model.init_states(1).keys())
     init_diagnos_keys = set(model.init_diagnos(1).keys())
 
@@ -83,9 +86,10 @@ def run_spinup_cycles(spinup_year, n_cycles, model_path, attr_tensor, land_mask,
         print(f"  Cycle {cycle}/{n_cycles} ...", end=" ", flush=True)
         with torch.no_grad():
             full_out = model(data_extended, date_seq=date_seq_tensor, mode='full', show_progress=False,
-                             states=states, diagnos=diagnos, log_to_cpu=False, compute_twsa=False)
+                             states=states, diagnos=diagnos, hidden=hidden, log_to_cpu=False, compute_twsa=False)
         states  = {k: v[:, -1, :].clone() for k, v in full_out['states'].items()  if k in init_state_keys}
         diagnos = {k: v[:, -1, :].clone() for k, v in full_out['diagnos'].items() if k in init_diagnos_keys}
+        hidden  = full_out['hidden']
         del full_out
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -96,6 +100,7 @@ def run_spinup_cycles(spinup_year, n_cycles, model_path, attr_tensor, land_mask,
     ckpt = {
         'states':  {k: v.detach().cpu() for k, v in states.items()},
         'diagnos': {k: v.detach().cpu() for k, v in diagnos.items()},
+        'hidden':  {k: (h.detach().cpu(), c.detach().cpu()) for k, (h, c) in hidden.items()},
     }
     torch.save(ckpt, os.path.join(out_dir, f"state_{spinup_year}_fold{fold}_seed{seed}.pt"))
     print(f"Spinup complete. State saved as state_{spinup_year}_fold{fold}_seed{seed}.pt")
@@ -105,6 +110,7 @@ def run_spinup_cycles(spinup_year, n_cycles, model_path, attr_tensor, land_mask,
 # Inference for one year
 # ----------------------------------------------------------
 def run_inference_for_year(year, model_path, attr_tensor, land_mask, n_space_total, lat_vals, lon_vals, out_dir, device, fold, seed):
+    """Run gridded MOREDO inference for one year and return the simulated fields."""
     import config
     from libs.model import HybridModel
     print(f"\n===== Running year: {year} =====")
@@ -116,11 +122,12 @@ def run_inference_for_year(year, model_path, attr_tensor, land_mask, n_space_tot
         ckpt = torch.load(prev_state_file, map_location='cpu', weights_only=True)
         prev_states  = {k: v.to(device) for k, v in ckpt['states'].items()}
         prev_diagnos = {k: v.to(device) for k, v in ckpt['diagnos'].items()}
+        prev_hidden  = {k: (h.to(device), c.to(device)) for k, (h, c) in ckpt['hidden'].items()} if ckpt.get('hidden') else None
     else:
         print("No previous state found. Spin-up mode.")
-        prev_states, prev_diagnos = None, None
+        prev_states, prev_diagnos, prev_hidden = None, None, None
 
-    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS).to(device)
+    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS, lstm_hidden_size=config.LSTM_HIDDEN_SIZE).to(device)
     model.load_state_dict(torch.load(model_path, weights_only=True, map_location=torch.device('cpu')))
     model.eval()
 
@@ -136,7 +143,7 @@ def run_inference_for_year(year, model_path, attr_tensor, land_mask, n_space_tot
     date_seq_tensor = torch.tensor([d.toordinal() for d in dates], dtype=torch.long, device=device)
 
     with torch.no_grad():
-        full_out = model(data_extended, date_seq=date_seq_tensor, mode='full', show_progress=True, states=prev_states, diagnos=prev_diagnos, log_to_cpu=True, compute_twsa=False)
+        full_out = model(data_extended, date_seq=date_seq_tensor, mode='full', show_progress=True, states=prev_states, diagnos=prev_diagnos, hidden=prev_hidden, log_to_cpu=True, compute_twsa=False)
 
     os.makedirs(out_dir, exist_ok=True)
     init_state_keys  = set(model.init_states(1).keys())
@@ -144,6 +151,7 @@ def run_inference_for_year(year, model_path, attr_tensor, land_mask, n_space_tot
     ckpt = {
         'states':  {k: v[:, -1, :].detach().cpu().clone() for k, v in full_out['states'].items() if k in init_state_keys},
         'diagnos': {k: v[:, -1, :].detach().cpu().clone() for k, v in full_out['diagnos'].items() if k in init_diagnos_keys},
+        'hidden':  {k: (h.detach().cpu().clone(), c.detach().cpu().clone()) for k, (h, c) in full_out['hidden'].items()},
     }
     torch.save(ckpt, os.path.join(out_dir, f"state_{year}_fold{fold}_seed{seed}.pt"))
     print(f"Saved state for {year}")

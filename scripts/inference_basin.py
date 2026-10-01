@@ -3,12 +3,13 @@ import pickle
 import torch
 
 def get_full_out(x_all, idx_daily, fold, seed, device, model_dir):
+    """Run a trained model over the full forcing for the selected basins and return its outputs."""
     import config
     from libs.model import HybridModel
 
     date_seq = torch.tensor([d.toordinal() for d in idx_daily], dtype=torch.long, device=device)
 
-    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS).to(device)
+    model = HybridModel(config.PARAM_CONFIG, nn_attr_cols=config.ATTR_NN_COLS, passthrough_cols=config.ATTR_PASSTHROUGH_COLS, input_cols=config.INPUT_COLS, lstm_hidden_size=config.LSTM_HIDDEN_SIZE).to(device)
     model.load_state_dict(torch.load(f"{model_dir}/best_model_seed{seed}_fold{fold}.pt", weights_only=True, map_location=torch.device('cpu')))
     model.eval()
 

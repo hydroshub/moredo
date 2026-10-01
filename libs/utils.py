@@ -42,11 +42,15 @@ def print_run_summary(x_all, y_all, z_all, idx_daily, idx_monthly, valid_ids, n_
     print(f"  Time (monthly): {idx_monthly[0].date()} → {idx_monthly[-1].date()}")
     print(SEP)
     print("Model summary")
-    mode_groups = {"static": []}
+    mode_groups = {"constant": [], "static": [], "dynamic_physical_state": [], "dynamic_driver_state": [], "dynamic_lstm_state": []}
     for pname, (bounds, mode, _) in config.PARAM_CONFIG.items():
         mode_groups[mode].append(f"{pname} {bounds}")
     labels = {
+        "constant":               "Scalar parameter(s)      (global learnable)",
         "static":                 "Static parameter(s)      (MLP, attr → param)",
+        "dynamic_physical_state": "Dynamic parameter(s)     (MLP, state+attr → param)",
+        "dynamic_driver_state":   "Dynamic parameter(s)     (MLP, driver+attr → param)",
+        "dynamic_lstm_state":     "Dynamic parameter(s)     (LSTM, driver+attr → param)",
     }
     for mode, params in mode_groups.items():
         if params:
@@ -55,6 +59,14 @@ def print_run_summary(x_all, y_all, z_all, idx_daily, idx_monthly, valid_ids, n_
                 print(f"    {p}")
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total trainable parameters: {total_params:,}")
+    print(SEP)
+    print("Loss summary")
+    loss_type = getattr(config, "LOSS_TYPE", "nse_pooled")
+    print(f"  Loss type    : {loss_type}")
+    if loss_type == "nse_star":
+        print(f"  NSE* eps     : {config.NSE_STAR_EPS}")
+        print(f"  Min obs/basin: {getattr(config, 'NSE_MIN_OBS', 10)}")
+    print(f"  Loss weights : {dict(zip(['q', 'et', 'swe', 'twsa'], config.LOSS_WEIGHTS))}")
     print(SEP)
 
 
@@ -70,6 +82,55 @@ def masked_nse_metric(pred, target, eps=1e-6):
     ss_res = ((pred - target) ** 2).sum()
     ss_tot = ((target - target.mean()) ** 2).sum()
     return (1.0 - ss_res / (ss_tot + eps)).item()
+
+
+def valid_basin_stats(target, min_obs=10):
+    """Per-basin statistics of a [basins, time] target over its finite time steps.
+
+    A basin is valid for NSE when it has at least `min_obs` finite observations and a
+    non-constant target (std > 0), the same rule as metrics.compute_basin_nse. Returns the
+    element mask restricted to valid basins [B, T], the basin mask [B], and the per-basin
+    mean and population std [B, 1] (detached)."""
+    finite = torch.isfinite(target)
+    n_b = finite.sum(dim=1, keepdim=True)
+    t0 = torch.where(finite, target, torch.zeros_like(target))
+    mean_b = t0.sum(dim=1, keepdim=True) / n_b.clamp(min=1)
+    var_b = (torch.where(finite, target - mean_b, torch.zeros_like(target)) ** 2).sum(
+        dim=1, keepdim=True) / n_b.clamp(min=1)
+    s_b = var_b.sqrt().detach()
+    basin_ok = (n_b >= min_obs) & (s_b > 0)                                   # [B, 1]
+    return finite & basin_ok, basin_ok.squeeze(1), mean_b.detach(), s_b
+
+
+def masked_nse_star_loss(pred, target, eps=0.1, min_obs=10):
+    """Basin-normalized NSE* loss (Kratzert et al., 2019, Eq. 13).
+
+    Squared errors are weighted by 1 / (s_b + eps)^2, where s_b is the std of the target in
+    basin b over the time steps of this split, so every basin is scored relative to its own
+    variability. The mean is taken over all valid (basin, time) elements, so basins with more
+    observations weigh more, as in Kratzert et al. (2019). Only valid basins enter (at least
+    `min_obs` observations and a non-constant target, see valid_basin_stats).
+
+    pred, target: [basins, time]"""
+    valid, basin_ok, _, s_b = valid_basin_stats(target, min_obs)
+    if not valid.any():
+        warnings.warn("masked_nse_star_loss: No valid basins! Returning 0.0")
+        return torch.tensor(0.0, device=target.device)
+    weights = 1.0 / (s_b + eps) ** 2                                           # [B, 1]
+    sq_err = (pred - torch.where(valid, target, pred)) ** 2                    # 0 where invalid, no NaN in the graph
+    return (weights * sq_err)[valid].mean()
+
+
+def masked_nse_per_basin(pred, target, min_obs=10):
+    """NSE of every basin (NaN for basins that are not valid, see valid_basin_stats).
+    pred, target: [basins, time]. Returns a float tensor [basins]."""
+    valid, basin_ok, mean_b, _ = valid_basin_stats(target, min_obs)
+    t = torch.where(valid, target, torch.zeros_like(target))
+    p = torch.where(valid, pred, torch.zeros_like(pred))
+    ss_res = ((p - t) ** 2 * valid).sum(dim=1)
+    ss_tot = ((t - mean_b) ** 2 * valid).sum(dim=1)
+    nse = 1.0 - ss_res / ss_tot.clamp(min=1e-12)
+    return torch.where(basin_ok, nse, torch.full_like(nse, float("nan")))
 
 
 def masked_nse_loss(pred, target, eps=1e-6):
@@ -99,11 +160,22 @@ def compute_losses(pred, y, z):
     i_et  = config.TARGET_DAILY_COLS.index(m["et"])
     i_swe = config.TARGET_DAILY_COLS.index(m["swe"])
     i_twsa = 0  # always single monthly target
+
+    loss_type = getattr(config, "LOSS_TYPE", "nse_pooled")
+    if loss_type == "nse_star":
+        eps = config.NSE_STAR_EPS
+        min_obs = getattr(config, "NSE_MIN_OBS", 10)
+        loss_fn = lambda p, t, k: masked_nse_star_loss(p, t, eps=eps[k], min_obs=min_obs)
+    elif loss_type == "nse_pooled":
+        loss_fn = lambda p, t, k: masked_nse_loss(p, t)
+    else:
+        raise ValueError(f"Unknown LOSS_TYPE: {loss_type}")
+
     return {
-        "q":    masked_nse_loss(pred["q"][:, :, 0],             y[:, :, i_q]),
-        "et":   masked_nse_loss(pred["et"][:, :, 0],            y[:, :, i_et]),
-        "swe":  masked_nse_loss(pred["swe"][:, :, 0],           y[:, :, i_swe]),
-        "twsa": masked_nse_loss(pred["twsa"][:, :, 0],  z[:, :, i_twsa]),
+        "q":    loss_fn(pred["q"][:, :, 0],    y[:, :, i_q],    "q"),
+        "et":   loss_fn(pred["et"][:, :, 0],   y[:, :, i_et],   "et"),
+        "swe":  loss_fn(pred["swe"][:, :, 0],  y[:, :, i_swe],  "swe"),
+        "twsa": loss_fn(pred["twsa"][:, :, 0], z[:, :, i_twsa], "twsa"),
     }
 
 
@@ -117,7 +189,8 @@ def train_model(
     model.to(device)
 
     # Optimizer and scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad],
+                                 lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
 
     best_val_loss = float("inf")
@@ -254,15 +327,25 @@ def evaluate_model(model, test_loader, device, date_seq):
                 preds_list[k].append(p.cpu())
                 targets_list[k].append(t.cpu())
 
-    nse = {}
+    min_obs = getattr(config, "NSE_MIN_OBS", 10)
+    nse, nse_basin = {}, {}
     for k in targets:
         p_all = torch.cat(preds_list[k])
         t_all = torch.cat(targets_list[k])
         nse[k] = masked_nse_metric(p_all, t_all)
+        per_basin = masked_nse_per_basin(p_all, t_all, min_obs=min_obs)
+        ok = torch.isfinite(per_basin)
+        nse_basin[k] = {
+            "median": per_basin[ok].median().item() if ok.any() else float("nan"),
+            "mean": per_basin[ok].mean().item() if ok.any() else float("nan"),
+            "n_valid": int(ok.sum()), "n_total": int(per_basin.numel()),
+        }
 
-    print("\n===== Test Set NSE =====")
-    for k, v in nse.items():
-        print(f"  {k}: {v:.4f}")
+    print("\n===== Test Set NSE (pooled | basin median, mean over valid basins) =====")
+    for k in targets:
+        b = nse_basin[k]
+        print(f"  {k}: {nse[k]:.4f} | {b['median']:.4f}, {b['mean']:.4f}  "
+              f"(valid basins {b['n_valid']}/{b['n_total']})")
 
-    return nse
+    return nse, nse_basin
 

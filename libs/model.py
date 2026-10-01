@@ -23,6 +23,59 @@ class StaticParamGenerator(nn.Module):
         return dict(zip(self.output_keys, torch.split(raw_out, 1, dim=-1)))
 
 
+# MLP: (physical states_t / 100, static attributes) → parameter (updates each timestep)
+class DynamicPhysicalParamGenerator(nn.Module):
+    def __init__(self, n_states, n_attrs, output_keys, hidden_dim=32, dropout=0.3):
+        super().__init__()
+        self.output_keys = output_keys
+        self.network = nn.Sequential(
+            nn.Linear(n_states + n_attrs, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, len(output_keys))
+        )
+
+    def forward(self, states_scaled, attr_input):
+        x = torch.cat([states_scaled, attr_input], dim=-1)
+        raw_out = self.network(x)
+        return dict(zip(self.output_keys, torch.split(raw_out, 1, dim=-1)))
+
+
+# MLP: (drivers_t, static attributes) → parameter (updates each timestep, no recurrence)
+class DynamicDriverParamGenerator(nn.Module):
+    def __init__(self, n_drivers, n_attrs, output_keys, hidden_dim=32, dropout=0.3):
+        super().__init__()
+        self.output_keys = output_keys
+        self.network = nn.Sequential(
+            nn.Linear(n_drivers + n_attrs, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, len(output_keys))
+        )
+
+    def forward(self, driver_input, attr_input):
+        x = torch.cat([driver_input, attr_input], dim=-1)
+        raw_out = self.network(x)
+        return dict(zip(self.output_keys, torch.split(raw_out, 1, dim=-1)))
+
+
+# LSTMCell: sequential (drivers_t, static attributes) → hidden → parameter
+class DynamicLSTMParamGenerator(nn.Module):
+    def __init__(self, n_drivers, n_attrs, hidden_size, output_keys, dropout=0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.output_keys = output_keys
+        self.lstm_cell = nn.LSTMCell(n_drivers + n_attrs, hidden_size)
+        self.dropout   = nn.Dropout(dropout)
+        self.head      = nn.Linear(hidden_size, len(output_keys))
+
+    def forward(self, driver_input, attr_input, h, c):
+        x = torch.cat([driver_input, attr_input], dim=-1)
+        h, c = self.lstm_cell(x, (h, c))
+        raw_out = self.head(self.dropout(h))
+        return dict(zip(self.output_keys, torch.split(raw_out, 1, dim=-1))), h, c
+
+
 class HydroProcess(nn.Module):
     def __init__(self):
         super().__init__()
@@ -82,7 +135,16 @@ class HydroProcess(nn.Module):
 
     def avai_bucket(self, drivers, params, states, fluxes, diagnos):
         # Update ecosystem-available soil water bucket
-        s_tmp = states['S_AVAI'] + fluxes['to_avai']
+        s_pre = states['S_AVAI'] + fluxes['to_avai']
+
+        # Lateral subsurface water contribution (0 unless 'lat_alpha' is in PARAM_CONFIG)
+        fluxes['f_lat'] = params.get('lat_alpha', 0.0) * params['avai_cap']
+        # If lat_alpha is allowed to be negative (signed-subsidy experiment), f_lat acts as a
+        # lateral loss; cap the withdrawal at the water currently in the bucket so storage cannot go
+        # below zero (and ET stays non-negative). For the default non-negative lat_alpha this clamp
+        # is inactive, since f_lat >= 0 >= -s_pre.
+        fluxes['f_lat'] = torch.clamp(fluxes['f_lat'], min=-s_pre)
+        s_tmp = s_pre + fluxes['f_lat']
 
         # Relative soil moisture (0–1) using fixed capacity threshold
         relmoist = torch.clamp(s_tmp / (params['avai_cap'] + 1e-6), 0.0, 1.0)
@@ -143,21 +205,45 @@ class HydroProcess(nn.Module):
         return drivers, params, states, fluxes, diagnos
 
 class HybridModel(nn.Module):
-    def __init__(self, param_config, nn_attr_cols, passthrough_cols, input_cols):
+    def __init__(self, param_config, nn_attr_cols, passthrough_cols, input_cols,
+                 lstm_hidden_size):
         super().__init__()
 
         self.param_config     = param_config
         self.nn_attr_cols     = list(nn_attr_cols)
         self.passthrough_cols = list(passthrough_cols) if passthrough_cols else []
+        self.lstm_hidden_size = lstm_hidden_size
         normed_attrs = [f"{c}_normed" for c in self.nn_attr_cols]
         raw_attrs    = [f"{c}_raw"    for c in self.passthrough_cols]
         self.all_cols = input_cols + normed_attrs + raw_attrs
 
+        n_drivers    = 4   # processed drivers: P, T, RAD, LAI
+        n_phys_states = 4  # S_SNOW, S_AVAI, S_FAST, S_SLOW
+
         self.param_generators = nn.ModuleDict()   # static
+        self.param_dyn_phys   = nn.ModuleDict()   # dynamic_physical_state
+        self.param_dyn_driver = nn.ModuleDict()   # dynamic_driver_state
+        self.param_dyn_lstm   = nn.ModuleDict()   # dynamic_lstm_state
+        self.param_constants  = nn.ParameterDict()
 
         for pname, (_, mode, attrs) in param_config.items():
-            if mode == 'static':
-                self.param_generators[pname] = StaticParamGenerator(len(attrs), [pname])
+            if mode == 'constant':
+                self.param_constants[pname] = nn.Parameter(torch.zeros(1))
+            elif mode == 'static':
+                # lat_alpha uses the same hidden width as the dynamic_driver_state and
+                # dynamic_lstm_state generators (32) so the three lateral-flow encoders are
+                # capacity-matched; all other static params keep the original default (16).
+                hidden_dim = 32 if pname == 'lat_alpha' else 16
+                self.param_generators[pname] = StaticParamGenerator(len(attrs), [pname], hidden_dim=hidden_dim)
+            elif mode == 'dynamic_physical_state':
+                self.param_dyn_phys[pname] = DynamicPhysicalParamGenerator(
+                    n_phys_states, len(attrs), [pname])
+            elif mode == 'dynamic_driver_state':
+                self.param_dyn_driver[pname] = DynamicDriverParamGenerator(
+                    n_drivers, len(attrs), [pname])
+            elif mode == 'dynamic_lstm_state':
+                self.param_dyn_lstm[pname] = DynamicLSTMParamGenerator(
+                    n_drivers, len(attrs), lstm_hidden_size, [pname])
 
         self.process = HydroProcess()
 
@@ -181,14 +267,53 @@ class HybridModel(nn.Module):
         }
         return diagnos
 
+    def init_hidden(self, batch_size, device=None):
+        if device is None:
+            device = next(self.parameters()).device
+        hidden = {}
+        for pname in self.param_dyn_lstm:
+            h = torch.zeros(batch_size, self.lstm_hidden_size, device=device)
+            c = torch.zeros(batch_size, self.lstm_hidden_size, device=device)
+            hidden[pname] = (h, c)
+        return hidden
 
-    def generate_params(self, x_attrs, drivers, states, diagnos):
+    def generate_params(self, x_attrs, drivers, states, diagnos, hidden):
+        B = next(iter(states.values())).shape[0]
+
+        sn = config.STATE_NORM
+        states_scaled = torch.cat([
+            (states['S_SNOW'] - sn['S_SNOW'][0]) / sn['S_SNOW'][1],
+            (states['S_AVAI'] - sn['S_AVAI'][0]) / sn['S_AVAI'][1],
+            (states['S_FAST'] - sn['S_FAST'][0]) / sn['S_FAST'][1],
+            (states['S_SLOW'] - sn['S_SLOW'][0]) / sn['S_SLOW'][1],
+        ], dim=-1)
+        dn = config.DRIVER_NORM
+        driver_input = torch.cat([
+            (drivers['P']   - dn['P'][0])   / dn['P'][1],
+            (drivers['T']   - dn['T'][0])   / dn['T'][1],
+            (drivers['RAD'] - dn['RAD'][0]) / dn['RAD'][1],
+            (drivers['LAI'] - dn['LAI'][0]) / dn['LAI'][1],
+        ], dim=-1)
 
         param_raw = {}
         for pname, (_, mode, attrs) in self.param_config.items():
-            if mode == 'static':
+            if mode == 'constant':
+                param_raw[pname] = self.param_constants[pname].view(1, 1).expand(B, 1)
+            elif mode == 'static':
                 attr_input = torch.cat([x_attrs[f"{c}_normed"] for c in attrs], dim=-1)
                 param_raw[pname] = self.param_generators[pname](attr_input)[pname]
+            elif mode == 'dynamic_physical_state':
+                attr_input = torch.cat([x_attrs[f"{c}_normed"] for c in attrs], dim=-1)
+                param_raw[pname] = self.param_dyn_phys[pname](states_scaled, attr_input)[pname]
+            elif mode == 'dynamic_driver_state':
+                attr_input = torch.cat([x_attrs[f"{c}_normed"] for c in attrs], dim=-1)
+                param_raw[pname] = self.param_dyn_driver[pname](driver_input, attr_input)[pname]
+            elif mode == 'dynamic_lstm_state':
+                attr_input = torch.cat([x_attrs[f"{c}_normed"] for c in attrs], dim=-1)
+                h, c = hidden[pname]
+                result, h, c = self.param_dyn_lstm[pname](driver_input, attr_input, h, c)
+                param_raw[pname] = result[pname]
+                hidden[pname] = (h, c)
 
         params = {}
         for k, ((low, high), _, __) in self.param_config.items():
@@ -217,8 +342,19 @@ class HybridModel(nn.Module):
         return params
     
 
-    def forward(self, x_seq, date_seq, mode='supervised', show_progress=False, states=None, diagnos=None, log_to_cpu=False, compute_twsa=True):
-        
+    def forward(self, x_seq, date_seq, mode='supervised', show_progress=False, states=None, diagnos=None, hidden=None, log_to_cpu=False, compute_twsa=True,
+                fadd_gate=None, ref_S_AVAI=None, ref_relmoist=None, reset_mask=None):
+        # Counterfactual hooks (all default None -> no-op, fully backward compatible), used by
+        # the F_add-suppression experiment (scripts/analysis/fadd_wholeperiod_counterfactual.py):
+        #   fadd_gate   [B, T]    per-day gate; f_lat is multiplied by (1 - fadd_gate[:, t]) so a
+        #                         value of 1 suppresses the learned subsidy on that day.
+        #   reset_mask  [B, T]    per-day flag; where 1, the ecosystem-available store S_AVAI and
+        #                         its rel_moist are overwritten with the reference-run values below
+        #                         at the start of that timestep, re-initializing an intervention
+        #                         episode from the reference state (all zero, i.e. unused, in the
+        #                         manuscript's whole-period counterfactual).
+        #   ref_S_AVAI, ref_relmoist  [B, T, 1]  the reference-run S_AVAI / rel_moist to inject.
+
         B, T, _ = x_seq.shape
         device = x_seq.device
 
@@ -241,6 +377,8 @@ class HybridModel(nn.Module):
             states = self.init_states(B, device=device)
         if diagnos is None:
             diagnos = self.init_diagnos(B, device=device)
+        if hidden is None:
+            hidden = self.init_hidden(B, device=device)
 
         # ---- ----- ----
         # Prepare normed LAI
@@ -282,8 +420,18 @@ class HybridModel(nn.Module):
             }
             diagnos['LAI_normed'] = lai_normed_seq[:, t, :]
 
+            # ---- Counterfactual: re-initialize the available store from the reference run ----
+            if reset_mask is not None:
+                m = reset_mask[:, t].to(states['S_AVAI'].dtype).view(-1, 1)  # [B, 1], 1 = reset
+                states['S_AVAI'] = m * ref_S_AVAI[:, t, :] + (1.0 - m) * states['S_AVAI']
+                diagnos['rel_moist'] = m * ref_relmoist[:, t, :] + (1.0 - m) * diagnos['rel_moist']
+
             # ---- Generate parameters ----
-            params = self.generate_params(x_attrs, drivers, states, diagnos)
+            params = self.generate_params(x_attrs, drivers, states, diagnos, hidden)
+
+            # ---- Counterfactual: gate off the learned subsidy on suppressed days ----
+            if fadd_gate is not None and 'lat_alpha' in params:
+                params['lat_alpha'] = params['lat_alpha'] * (1.0 - fadd_gate[:, t].view(-1, 1))
 
             # ---- Run hydro process ----
             fluxes = {}
@@ -371,6 +519,7 @@ class HybridModel(nn.Module):
                 'states':  all_states,
                 'diagnos': all_diagnos,
                 'params':  all_params,
+                'hidden':  hidden,
             }
         else:
             raise ValueError(f"Unknown mode: {mode}")

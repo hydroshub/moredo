@@ -4,3 +4,7 @@ __pycache__/
 cache/
 logs/
 results*/
+data/
+# machine-specific settings of the latent-subsidy pipeline (see README_latent_subsidy.md, Paths)
+scripts/analysis/project_paths_local.py
+slurm/site_local.sh
